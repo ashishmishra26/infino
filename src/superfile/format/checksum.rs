@@ -18,7 +18,6 @@
 //! `crc-fast` exposes this as `CrcAlgorithm::Crc32Iscsi` /
 //! `crc32_iscsi(...)`.
 
-#[cfg(test)]
 use crc_fast::CrcAlgorithm;
 
 /// Compute CRC32C over `bytes`. Hardware-accelerated when the crate's
@@ -31,12 +30,10 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 
 /// Streaming variant — extend a prior `prev` CRC by `bytes`. Implemented
 /// via `checksum_combine` polynomial math (`crc-fast` doesn't expose a
-/// seed-from-prev API on its `Digest`). Not on any production hot path
-/// today; kept so callers and tests don't have to know which upstream
-/// crate backs the shim.
-#[cfg(test)]
+/// seed-from-prev API on its `Digest`). Used by streaming builders and
+/// kept here so callers don't reach for the upstream crate directly.
 #[inline]
-fn crc32c_append(prev: u32, bytes: &[u8]) -> u32 {
+pub fn crc32c_append(prev: u32, bytes: &[u8]) -> u32 {
     let suffix = crc_fast::crc32_iscsi(bytes) as u64;
     crc_fast::checksum_combine(
         CrcAlgorithm::Crc32Iscsi,

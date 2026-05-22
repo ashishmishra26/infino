@@ -110,7 +110,7 @@ fn infino_reader() -> VectorReader {
 fn build_infino_blob(vectors: &[f32]) -> Vec<u8> {
     let n_cent = corpus::n_cent(N_DOCS);
     let builder = corpus::build_vector_index(vectors, N_DOCS, n_cent, Metric::Cosine);
-    builder.finish()
+    builder.finish().expect("finish vector builder")
 }
 
 fn open_infino_reader(blob: Vec<u8>) -> VectorReader {
