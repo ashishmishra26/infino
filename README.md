@@ -38,7 +38,7 @@ uv pip install infino
 **Node.js**
 
 ```sh
-npm install infino --registry https://npm-proxy.fury.io/infino/
+npm install infino
 ```
 
 **Rust**

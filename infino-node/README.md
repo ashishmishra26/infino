@@ -21,16 +21,17 @@ for an apache-arrow `Table` instead.
 ## Install
 
 ```sh
-npm install infino --registry https://npm-proxy.fury.io/infino/
+npm install infino
 ```
 
 A prebuilt native binary is selected automatically at install time — no Rust
 toolchain required. Supported platforms:
 
-| Platform      | Architectures |
-| ------------- | ------------- |
-| macOS         | x64, arm64    |
-| Linux (glibc) | x64, arm64    |
+| Platform              | Architectures |
+| --------------------- | ------------- |
+| macOS                 | x64, arm64    |
+| Linux (glibc)         | x64, arm64    |
+| Linux (musl / Alpine) | x64, arm64    |
 
 `apache-arrow` is installed as a dependency and used at the boundary (passing in
 `Table`s, or `{ arrow: true }` results). Requires Node.js >= 18.
@@ -211,13 +212,13 @@ console.log(stats.matched, stats.nTombstoned, stats.nNotFound);
 number you supply, otherwise it throws. Both methods return `{ matched,
 nTombstoned, nNotFound }`.
 
-## Optimization
+## Optimize
 
-Many small appends produce many small files. `optimize` merges small or
-underfilled files into larger ones, which keeps reads efficient.
+Many small appends produce many small files. `optimize` compacts them —
+merging small or underfilled files into larger ones — which keeps reads efficient.
 
 ```javascript
-docs.optimize();                                                 // engine defaults
+docs.optimize();                                                  // engine defaults
 docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50 });
 ```
 

@@ -14,18 +14,23 @@
   },
   "keywords": [
     "search",
+    "vector",
+    "database",
     "full-text-search",
     "vector-search",
     "vector-database",
     "hybrid-search",
     "semantic-search",
     "bm25",
+    "ann",
+    "knn",
     "sql",
+    "ai",
+    "llm",
     "rag",
     "agent-memory",
     "retrieval",
     "embeddings",
-    "knn",
     "embedded-database",
     "object-storage",
     "parquet",
@@ -36,6 +41,13 @@
   ],
   "main": "infino/index.js",
   "types": "infino/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./infino/index.d.ts",
+      "default": "./infino/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "napi": {
     "name": "infino",
     "triples": {
@@ -44,7 +56,9 @@
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
         "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu"
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl"
       ]
     }
   },
@@ -65,7 +79,9 @@
     "infino-darwin-x64": "0.1.0",
     "infino-darwin-arm64": "0.1.0",
     "infino-linux-x64-gnu": "0.1.0",
-    "infino-linux-arm64-gnu": "0.1.0"
+    "infino-linux-arm64-gnu": "0.1.0",
+    "infino-linux-x64-musl": "0.1.0",
+    "infino-linux-arm64-musl": "0.1.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",
