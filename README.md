@@ -458,7 +458,7 @@ Full documentation is at [infino.ai/docs](https://infino.ai/docs). Start here:
 - [Parquet interop](https://infino.ai/docs/guides/parquet-interop) — read the same file with DuckDB, pyarrow, and DataFusion
 - [Embeddings](https://infino.ai/docs/guides/embeddings) and [storage](https://infino.ai/docs/guides/storage) — bring your own vectors; run on local disk, S3, GCS, or Azure
 
-The same pages are available as Markdown source for agents and offline reading:
+The same pages are available as Markdown source on GitHub:
 [quickstart](https://github.com/infino-ai/docs/blob/main/quickstart.mdx),
 [core concepts](https://github.com/infino-ai/docs/blob/main/core-concepts.mdx),
 [search](https://github.com/infino-ai/docs/blob/main/guides/search.mdx),
