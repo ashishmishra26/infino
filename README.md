@@ -458,6 +458,18 @@ Full documentation is at [infino.ai/docs](https://infino.ai/docs). Start here:
 - [Parquet interop](https://infino.ai/docs/guides/parquet-interop) — read the same file with DuckDB, pyarrow, and DataFusion
 - [Embeddings](https://infino.ai/docs/guides/embeddings) and [storage](https://infino.ai/docs/guides/storage) — bring your own vectors; run on local disk, S3, GCS, or Azure
 
+The same pages are available as Markdown source for agents and offline reading:
+[quickstart](https://github.com/infino-ai/docs/blob/main/quickstart.mdx),
+[core concepts](https://github.com/infino-ai/docs/blob/main/core-concepts.mdx),
+[search](https://github.com/infino-ai/docs/blob/main/guides/search.mdx),
+[hybrid search on Parquet](https://github.com/infino-ai/docs/blob/main/guides/hybrid-search-on-parquet.mdx),
+[SQL reference](https://github.com/infino-ai/docs/blob/main/sql-reference.mdx),
+[agent memory](https://github.com/infino-ai/docs/blob/main/use-cases/agent-memory.mdx),
+[MCP](https://github.com/infino-ai/docs/blob/main/integrations/mcp.mdx),
+[Parquet interop](https://github.com/infino-ai/docs/blob/main/guides/parquet-interop.mdx),
+[embeddings](https://github.com/infino-ai/docs/blob/main/guides/embeddings.mdx),
+[storage](https://github.com/infino-ai/docs/blob/main/guides/storage.mdx).
+
 Design references (in this repo):
 
 - [Overview](docs/architecture/overview.md) — the mental model, and how this compares
