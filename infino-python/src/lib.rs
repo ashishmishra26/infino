@@ -1189,6 +1189,18 @@ impl Table {
             .map_err(py_err)
     }
 
+    /// `column`'s rows counted per value, as `SELECT column, COUNT(*) ...
+    /// GROUP BY column` gives them: a pyarrow `Table` of each value and its
+    /// `count(*)`, with a null value for the rows that hold none. Read from
+    /// the table's statistics when they count every row exactly, without
+    /// running a query; the grouped count runs otherwise.
+    fn value_counts<'py>(&self, py: Python<'py>, column: &str) -> PyResult<Bound<'py, PyAny>> {
+        let batch = py
+            .detach(|| self.inner.value_counts(column))
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, vec![batch])
+    }
+
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column` / `text_query` (under `mode`) drive BM25;
     /// `vector_column` / `vector_query` drive vector kNN — probe width

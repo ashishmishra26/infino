@@ -621,6 +621,17 @@ export class Table {
     return guard(this.remote, () => this.inner.count(column, query, opts.mode));
   }
 
+  /** `column`'s rows counted per value, as `SELECT column, COUNT(*) ...
+   * GROUP BY column` gives them: one record per value with its `count(*)`, a
+   * null value for the rows that hold none (or an Arrow `Table`). Read from
+   * the table's statistics when they count every row exactly, without
+   * running a query; the grouped count runs otherwise. */
+  valueCounts(column: string, opts: { arrow: true }): arrow.Table;
+  valueCounts(column: string, opts?: { arrow?: boolean }): RowRecord[];
+  valueCounts(column: string, opts: { arrow?: boolean } = {}): RowRecord[] | arrow.Table {
+    return decode(guard(this.remote, () => this.inner.valueCounts(column)), opts.arrow);
+  }
+
   /** Replace rows matching a SQL predicate (e.g. `"status = 'spam'"`) with
    * `data` (same shapes as `append`), 1:1 — the matched count must equal the
    * replacement-row count. Requires durable storage (not `memory://`). */
