@@ -65,7 +65,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{ColumnStatistics, Statistics, runtime::SpawnedTask, stats::Precision},
+    common::{ColumnStatistics, DFSchema, Statistics, runtime::SpawnedTask, stats::Precision},
     datasource::{
         listing::PartitionedFile,
         physical_plan::{
@@ -76,8 +76,9 @@ use datafusion::{
     },
     error::{DataFusionError, Result as DfResult},
     execution::object_store::ObjectStoreUrl,
-    logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType},
+    logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType, utils::conjunction},
     object_store::path::Path as ObjPath,
+    physical_expr::create_physical_expr,
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
@@ -114,6 +115,9 @@ use crate::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
             exec::{
+                cached_scan_exec::{
+                    CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
+                },
                 common::{BoundPredicate, PushedPredicate, take_rows},
                 metered_exec::MeteredExec,
             },
@@ -1631,6 +1635,30 @@ impl TableProvider for SupertableProvider {
             }
         };
 
+        // The files a scan of kept decoded columns would read (built below,
+        // once the Parquet scan it stands in for is). Not for a scan the index
+        // narrowed to a few rows (the Parquet scan decodes just their pages),
+        // nor for a scan of no column.
+        let output = projected_schema(&self.schema, projection)?;
+        let cached_files = (self.manifest.options.decoded_columns.is_some()
+            && has_columns(&output)
+            && superfiles.iter().all(|seg| seg.candidates.is_none()))
+        .then(|| {
+            superfiles
+                .iter()
+                .zip(&survivor_entries)
+                .map(|(seg, entry)| CachedFile {
+                    uri: entry.uri,
+                    reader: Arc::clone(&seg.prepared.reader),
+                    row_counts: Arc::clone(&seg.prepared.row_counts),
+                    tombstones: Arc::clone(&seg.tombstones),
+                })
+                .collect::<Vec<_>>()
+        });
+        let cached_stats = cached_files
+            .is_some()
+            .then(|| scan_stats.clone().project(projection));
+
         let url = self.store_url.clone();
         state
             .runtime_env()
@@ -1657,17 +1685,57 @@ impl TableProvider for SupertableProvider {
         // deleted rows. `effective_limit` above pushes our own limit only
         // when there are no filters, for the same reason.
         let scan = DataSourceExec::from_data_source(config);
-        let op_stats = self.scan_store.op_stats();
-        let meter = if filters.is_empty() {
-            MeteredExec::new(scan, op_stats)
-        } else {
-            MeteredExec::without_limit_pushdown(scan, op_stats)
+        let meter = |scan: Arc<dyn ExecutionPlan>| {
+            let op_stats = self.scan_store.op_stats();
+            if filters.is_empty() {
+                MeteredExec::new(scan, op_stats)
+            } else {
+                MeteredExec::without_limit_pushdown(scan, op_stats)
+            }
         };
-        Ok(Arc::new(
-            meter
+        let parquet: Arc<dyn ExecutionPlan> = Arc::new(
+            meter(scan)
                 .with_footers(Arc::clone(&self.scan_footers))
                 .with_read_ahead(read_ahead),
-        ))
+        );
+
+        // With decoded columns kept across statements, the scan reads them
+        // rather than the files' pages, and keeps the Parquet scan above as
+        // the one a plan can take back. The `WHERE` is planned against the
+        // scan schema and mapped onto each file by the same adapter the
+        // Parquet scan uses, so the cached scan skips the row groups the
+        // Parquet scan would. A `WHERE` that doesn't plan here skips
+        // nothing; the filter above still checks every row.
+        if let (Some(cache), Some(files), Some(stats)) = (
+            self.manifest.options.decoded_columns.as_ref(),
+            cached_files,
+            cached_stats,
+        ) {
+            let filter = conjunction(filters.iter().cloned())
+                .zip(DFSchema::try_from(Arc::clone(&self.schema)).ok())
+                .and_then(|(conjunction, schema)| {
+                    create_physical_expr(&conjunction, &schema, state.execution_props()).ok()
+                })
+                .map(|predicate| RowGroupFilter {
+                    predicate,
+                    table: Arc::clone(&self.schema),
+                    adapter: Arc::new(TableExprAdapterFactory::new(&self.manifest)),
+                });
+            if let Some(cached) = CachedScanExec::try_new(
+                output,
+                files,
+                filter,
+                Arc::clone(&self.manifest),
+                self.scan_store.op_stats(),
+                Arc::clone(cache),
+                state.config().target_partitions(),
+                stats,
+                Arc::clone(&parquet),
+            ) {
+                return Ok(Arc::new(meter(Arc::new(cached))));
+            }
+        }
+        Ok(parquet)
     }
 }
 

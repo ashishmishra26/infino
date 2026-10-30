@@ -12,7 +12,10 @@
 //! logically hold, and compaction is checked to converge every file to the
 //! table's current shape.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
@@ -20,7 +23,13 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use datafusion::{
+    physical_plan::ExecutionPlan,
+    prelude::{col, lit},
+};
+use futures::{FutureExt, StreamExt};
 use tempfile::TempDir;
+use tokio::{runtime::Builder, time::sleep};
 
 use super::{FieldId, map::FileSchemaMap, with_field_id};
 use crate::{
@@ -32,7 +41,11 @@ use crate::{
         fts::reader::{Bm25SearchOptions, BoolMode},
         vector::{builder::VectorConfig, distance::Metric},
     },
-    supertable::{Supertable, SupertableOptions, writer::commit_built_superfile},
+    supertable::{
+        Supertable, SupertableOptions, SupertableReader,
+        query::{column_cache::DecodedColumnCache, scalar_cache::ByteLru},
+        writer::commit_built_superfile,
+    },
     test_helpers::{decimal128_id_field, decimal128_ids},
 };
 
@@ -46,6 +59,33 @@ const TAG: FieldId = FieldId(4);
 /// The id of a column the table never had: a file carrying it was written
 /// under a schema that has since dropped the column.
 const DROPPED: FieldId = FieldId(9);
+/// Budget for the decoded columns the kept-column test reads back: room for
+/// every column of every generation.
+const KEPT_COLUMN_BYTES: usize = 16 << 20;
+/// A score of a current-shape file the kept-column test deletes.
+const DELETED_SCORE: i64 = 42;
+/// A tag of the file holding `tag` as a narrow string, deleted in the same test.
+const DELETED_TAG: &str = "h";
+/// Rows the plain-LIMIT test asks for: fewer than pass its filter, more than
+/// one file holds.
+const LIMITED_ROWS: usize = 5;
+/// Rows of the one file the row-group pruning test writes, scored in order.
+const SORTED_ROWS: i64 = 100;
+/// Rows per row group of that file: ten row groups.
+const SORTED_ROW_GROUP_ROWS: usize = 10;
+/// Characters of each title in that file: wide beside the 8-byte score, so
+/// a top-k on the score can skip most of the bytes.
+const WIDE_TITLE_LEN: usize = 64;
+/// Kept bytes too few for even one row group's title column.
+const TOO_FEW_KEPT_BYTES: usize = 64;
+/// The score the `ORDER BY ... LIMIT` test filters above.
+const TOP_SCORES_ABOVE: i64 = 50;
+/// Columns one row group keeps for `SELECT title, score`.
+const KEPT_PER_ROW_GROUP: usize = 2;
+/// How long a dropped read is given to finish its decode and keep it.
+const KEEP_WAIT: Duration = Duration::from_secs(10);
+/// How often the test looks for the kept columns meanwhile.
+const KEEP_POLL: Duration = Duration::from_millis(10);
 
 /// One logical row as the table reads it.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,12 +106,14 @@ fn table_schema() -> Arc<Schema> {
     ]))
 }
 
-fn table(dir: &TempDir) -> Supertable {
+/// The table, its SQL scans keeping decoded columns in `kept` when given.
+fn table(dir: &TempDir, kept: Option<Arc<DecodedColumnCache>>) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let options = SupertableOptions::new(table_schema(), vec![FtsConfig::new("title")], vec![])
+    let mut options = SupertableOptions::new(table_schema(), vec![FtsConfig::new("title")], vec![])
         .expect("options")
         .with_storage(storage);
+    options.decoded_columns = kept;
     Supertable::create(options).expect("create")
 }
 
@@ -376,7 +418,15 @@ fn generations() -> Vec<(Bytes, Vec<Row>)> {
 
 /// The table with every generation committed, and the rows it holds.
 fn mixed_table(dir: &TempDir) -> (Supertable, Vec<Row>) {
-    let st = table(dir);
+    mixed_table_with(dir, None)
+}
+
+/// [`mixed_table`], its SQL scans keeping decoded columns in `kept`.
+fn mixed_table_with(
+    dir: &TempDir,
+    kept: Option<Arc<DecodedColumnCache>>,
+) -> (Supertable, Vec<Row>) {
+    let st = table(dir, kept);
     let mut rows = Vec::new();
     for (bytes, generation_rows) in generations() {
         commit_built_superfile(&st, bytes).expect("commit generation");
@@ -459,6 +509,293 @@ fn sql_reads_every_generation_as_the_table_sees_it() {
         .cloned()
         .collect();
     assert_eq!(rows_of_batches(&batches), want);
+}
+
+#[test]
+fn sql_reads_every_generation_from_kept_columns() {
+    // The same reads with the scan keeping decoded columns. The first pass
+    // decodes every generation's columns through its map and keeps them.
+    // Rows are then deleted — one of a current-shape file and one of a file
+    // holding `tag` as a narrow string — and the reads that follow come from
+    // the kept columns, which still hold the deleted rows: the scan must
+    // leave them out.
+    let dir = TempDir::new().expect("tempdir");
+    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let (st, all) = mixed_table_with(&dir, Some(Arc::clone(&kept)));
+    let scans: [(&str, Box<dyn Fn(&Row) -> bool>); 3] = [
+        (
+            "SELECT _id, title, score, rating, tag FROM supertable ORDER BY _id",
+            Box::new(|_| true),
+        ),
+        (
+            "SELECT _id, title, score, rating, tag FROM supertable WHERE score > 20 ORDER BY _id",
+            Box::new(|r| r.score.is_some_and(|s| s > 20)),
+        ),
+        (
+            "SELECT _id, title, score, rating, tag FROM supertable WHERE tag = 'i' OR rating < 3.5 ORDER BY _id",
+            Box::new(|r| r.tag.as_deref() == Some("i") || r.rating.is_some_and(|x| x < 3.5)),
+        ),
+    ];
+    let check = |pass: &str, reader: &SupertableReader, expected: &[Row]| {
+        for (sql, keep) in &scans {
+            let batches = reader.query_sql(sql).expect("sql");
+            let want: Vec<Row> = expected.iter().filter(|r| keep(r)).cloned().collect();
+            assert_eq!(rows_of_batches(&batches), want, "{pass}: {sql}");
+        }
+    };
+    check("decoded", &st.reader().expect("reader"), &all);
+    st.delete(col("score").eq(lit(DELETED_SCORE)))
+        .expect("delete by score");
+    st.delete(col("tag").eq(lit(DELETED_TAG)))
+        .expect("delete by tag");
+    let expected: Vec<Row> = all
+        .into_iter()
+        .filter(|r| r.score != Some(DELETED_SCORE) && r.tag.as_deref() != Some(DELETED_TAG))
+        .collect();
+    let reader = st.reader().expect("reader");
+    check("kept, after deletes", &reader, &expected);
+    check("kept again", &reader, &expected);
+    let plan: String = reader
+        .query_sql(&format!("EXPLAIN {}", scans[1].0))
+        .expect("explain")
+        .iter()
+        .flat_map(|b| {
+            let plans = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan column")
+                .clone();
+            (0..plans.len()).map(move |i| plans.value(i).to_owned())
+        })
+        .collect();
+    assert!(plan.contains("CachedScanExec"), "{plan}");
+}
+
+#[test]
+fn a_plain_limit_gathers_kept_columns_in_stages() {
+    // A filtered scan of kept columns under a plain LIMIT is gathered in
+    // stages, as the Parquet scan is: partition 0 runs alone behind the gate,
+    // and the others start only if its first batch falls short. Every row
+    // returned passes the filter.
+    let dir = TempDir::new().expect("tempdir");
+    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let (st, expected) = mixed_table_with(&dir, Some(kept));
+    let reader = st.reader().expect("reader");
+    let sql = format!(
+        "SELECT _id, title, score, rating, tag FROM supertable WHERE score > 20 LIMIT {LIMITED_ROWS}"
+    );
+    let plan = explained(&reader, &sql);
+    // The gather staged over the gate on the kept columns' scan, with no
+    // exchange below the filter pulling batches ahead of the limit.
+    assert!(plan.contains("StagedCoalesceExec"), "{plan}");
+    let below_filter = plan.split_once("FilterExec").map_or("", |(_, rest)| rest);
+    assert!(below_filter.contains("ScanGateExec"), "{plan}");
+    assert!(below_filter.contains("CachedScanExec"), "{plan}");
+    assert!(!below_filter.contains("RoundRobinBatch"), "{plan}");
+    let passing: Vec<Row> = expected
+        .into_iter()
+        .filter(|r| r.score.is_some_and(|s| s > 20))
+        .collect();
+    let rows = rows_of_batches(&reader.query_sql(&sql).expect("sql"));
+    assert_eq!(rows.len(), LIMITED_ROWS);
+    assert!(rows.iter().all(|row| passing.contains(row)), "{rows:?}");
+}
+
+/// The kept-columns scan skips the row groups whose statistics show the
+/// `WHERE` can't match, as the Parquet scan does: over one file of scores in
+/// order, a range on the last row group reads that row group alone, and gives
+/// back exactly its rows on the first pass and on the kept one.
+#[test]
+fn kept_columns_skip_the_row_groups_a_where_rules_out() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = sorted_table(&dir, KEPT_COLUMN_BYTES);
+    let reader = st.reader().expect("reader");
+    let last = SORTED_ROWS - SORTED_ROW_GROUP_ROWS as i64;
+    let sql = format!("SELECT title, score FROM supertable WHERE score >= {last} ORDER BY score");
+    let row_groups = (SORTED_ROWS as usize).div_ceil(SORTED_ROW_GROUP_ROWS);
+    assert_eq!(
+        cached_row_groups(&explained(&reader, &sql)),
+        (1, row_groups - 1),
+        "only the last row group can match"
+    );
+    let want: Vec<i64> = (last..SORTED_ROWS).collect();
+    for pass in ["first", "kept"] {
+        assert_eq!(
+            scores_of(&reader.query_sql(&sql).expect("sql")),
+            want,
+            "{pass} pass"
+        );
+    }
+}
+
+/// A scan whose columns would not fit the kept bytes is read from the files:
+/// kept, its row groups would push each other out, and every run would
+/// decode them all again.
+#[test]
+fn a_scan_whose_columns_dont_fit_the_kept_bytes_reads_the_files() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = sorted_table(&dir, TOO_FEW_KEPT_BYTES);
+    let reader = st.reader().expect("reader");
+    let sql = "SELECT title, score FROM supertable WHERE score >= 0 ORDER BY score";
+    let plan = explained(&reader, sql);
+    assert!(!plan.contains("CachedScanExec"), "{plan}");
+    assert!(plan.contains("DataSourceExec"), "{plan}");
+    let want: Vec<i64> = (0..SORTED_ROWS).collect();
+    assert_eq!(scores_of(&reader.query_sql(sql).expect("sql")), want);
+}
+
+/// A filtered `ORDER BY ... LIMIT` whose other columns are wide is read
+/// through the Parquet scan's row filter, which decodes them only for the
+/// rows that pass, rather than from kept columns decoded for every row.
+#[test]
+fn a_filtered_order_by_limit_reads_through_the_row_filter() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = sorted_table(&dir, KEPT_COLUMN_BYTES);
+    let reader = st.reader().expect("reader");
+    let sql = format!(
+        "SELECT title, score FROM supertable WHERE score > {TOP_SCORES_ABOVE} \
+         ORDER BY score DESC LIMIT {LIMITED_ROWS}"
+    );
+    let plan = explained(&reader, &sql);
+    assert!(!plan.contains("CachedScanExec"), "{plan}");
+    assert!(plan.contains("DataSourceExec"), "{plan}");
+    let want: Vec<i64> = (SORTED_ROWS - LIMITED_ROWS as i64..SORTED_ROWS)
+        .rev()
+        .collect();
+    assert_eq!(scores_of(&reader.query_sql(&sql).expect("sql")), want);
+}
+
+/// One file of [`SORTED_ROWS`] rows scored in order, in row groups of
+/// [`SORTED_ROW_GROUP_ROWS`], each with a [`WIDE_TITLE_LEN`]-character title,
+/// its SQL scans keeping up to `kept_bytes` of decoded columns.
+fn sorted_table(dir: &TempDir, kept_bytes: usize) -> Supertable {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let mut options = SupertableOptions::new(table_schema(), vec![], vec![])
+        .expect("options")
+        .with_storage(storage);
+    options.decoded_columns = Some(Arc::new(ByteLru::new(kept_bytes)));
+    options.row_group_size = Some(SORTED_ROW_GROUP_ROWS);
+    let st = Supertable::create(options).expect("create");
+    let scores: Vec<i64> = (0..SORTED_ROWS).collect();
+    let titles: Vec<String> = scores
+        .iter()
+        .map(|s| format!("{s:0>width$}", width = WIDE_TITLE_LEN))
+        .collect();
+    let batch = RecordBatch::try_new(
+        table_schema(),
+        vec![
+            Arc::new(LargeStringArray::from(titles)),
+            Arc::new(Int64Array::from(scores)),
+            Arc::new(Float64Array::from(vec![None; SORTED_ROWS as usize])),
+            Arc::new(LargeStringArray::from(vec![
+                None::<&str>;
+                SORTED_ROWS as usize
+            ])),
+        ],
+    )
+    .expect("batch");
+    let mut writer = st.writer().expect("writer");
+    writer.append(&batch).expect("append");
+    writer.commit().expect("commit");
+    st
+}
+
+/// The `score` column across `batches`, in order.
+fn scores_of(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let scores = b
+                .column_by_name("score")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .expect("score")
+                .clone();
+            (0..scores.len()).map(move |i| scores.value(i))
+        })
+        .collect()
+}
+
+/// The `EXPLAIN` of `sql` on `reader`, every plan line joined.
+fn explained(reader: &SupertableReader, sql: &str) -> String {
+    reader
+        .query_sql(&format!("EXPLAIN {sql}"))
+        .expect("explain")
+        .iter()
+        .flat_map(|b| {
+            let plans = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan column")
+                .clone();
+            (0..plans.len()).map(move |i| plans.value(i).to_owned())
+        })
+        .collect()
+}
+
+/// The row groups the plan's `CachedScanExec` reads, and the ones its
+/// `WHERE` ruled out.
+fn cached_row_groups(plan: &str) -> (usize, usize) {
+    let count = |label: &str| {
+        plan.split_once(label)
+            .and_then(|(_, rest)| rest.split(',').next())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no {label} in {plan}"))
+    };
+    (count("row_groups="), count("pruned="))
+}
+
+/// The plan's `CachedScanExec`, wherever it sits.
+fn cached_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    if plan.name() == "CachedScanExec" {
+        return Some(Arc::clone(plan));
+    }
+    plan.children().into_iter().find_map(cached_scan)
+}
+
+#[test]
+fn a_read_dropped_halfway_still_keeps_its_columns() {
+    // A `LIMIT` drops a partition's stream once it has its rows, often with a
+    // row group's decode still in flight. That decode must run to the end and
+    // keep its columns, or every such statement decodes them again.
+    let dir = TempDir::new().expect("tempdir");
+    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let (st, _) = mixed_table_with(&dir, Some(Arc::clone(&kept)));
+    let reader = st.reader().expect("reader");
+    let ctx = reader.sql_session_context().expect("session");
+    // One thread: the decode the first poll spawns cannot start until this
+    // task yields, and polling once does not yield, so the stream is always
+    // dropped with the decode still to run. On a multi-thread runtime another
+    // worker can run it to the end inside that one poll.
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async {
+        let plan = ctx
+            .sql("SELECT title, score FROM supertable")
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let scan = cached_scan(&plan).expect("a CachedScanExec in the plan");
+        let mut batches = scan.execute(0, ctx.task_ctx()).expect("execute");
+        // One poll spawns the first row group's decode; the stream is then
+        // dropped before the decode has run.
+        assert!(
+            batches.next().now_or_never().is_none(),
+            "the decode answered within one poll"
+        );
+        drop(batches);
+        let deadline = Instant::now() + KEEP_WAIT;
+        while kept.len() < KEPT_PER_ROW_GROUP && Instant::now() < deadline {
+            sleep(KEEP_POLL).await;
+        }
+    });
+    assert_eq!(kept.len(), KEPT_PER_ROW_GROUP);
 }
 
 #[test]
